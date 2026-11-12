@@ -1,0 +1,163 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+)
+
+const (
+	appName    = "notifr"
+	appVersion = "0.1.0"
+)
+
+type Server struct {
+	notifications map[int]Notification
+	nextID        int
+	logger        *slog.Logger
+}
+
+type Notification struct {
+	ID        int    `json:"id"`
+	Recipient string `json:"to"`
+	Subject   string `json:"subject"`
+	Body      string `json:"body"`
+	Channel   string `json:"channel"`
+	IsUrgent  bool   `json:"urgent"`
+}
+
+func (n Notification) Format() string {
+	return fmt.Sprintf("to: %s | subject: %s | body: %s | channel: %s", n.Recipient, n.Subject, n.Body, n.Channel)
+}
+
+func (n Notification) Validate() error {
+	if n.Recipient == "" {
+		return fmt.Errorf("recipient not set")
+	}
+	return nil
+}
+
+func (s *Server) healthHanlder(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte(`{"status": "ok", "version":"` + appVersion + `"}`))
+}
+
+func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
+	var all []Notification
+	for _, n := range s.notifications {
+		all = append(all, n)
+	}
+
+	js, err := json.Marshal(all)
+	if err != nil {
+		s.logger.Error("marshal error: ", err)
+		return
+	}
+
+	w.Write(js)
+}
+
+func (s *Server) getNotification(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error": "invalid id"}`))
+		return
+	}
+
+	n, ok := s.notifications[id]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error": "invalid id"}`))
+		return
+	}
+
+	js, err := json.Marshal(n)
+	if err != nil {
+		s.logger.Error("marshal error: ", err)
+		return
+	}
+
+	w.Write(js)
+}
+
+func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
+	var n Notification
+
+	err := json.NewDecoder(r.Body).Decode(&n)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error": "invalid json"}`))
+		return
+	}
+
+	err = n.Validate()
+	if err != nil {
+		errResp := struct {
+			Error string `json:"error"`
+		}{
+			Error: err.Error(),
+		}
+
+		js, err := json.Marshal(errResp)
+		if err != nil {
+			s.logger.Error("marshal error: ", err)
+			return
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(js)
+		return
+	}
+
+	s.nextID++
+	n.ID = s.nextID
+	s.notifications[n.ID] = n
+
+	js, err := json.Marshal(n)
+	if err != nil {
+		s.logger.Error("marshal error: ", err)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	w.Write(js)
+}
+
+func (s *Server) logRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		s.logger.Info("request completed", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start), "from", r.RemoteAddr)
+	})
+}
+
+func contentType(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-type", "application/json")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	s := &Server{
+		notifications: map[int]Notification{},
+		logger:        logger,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.healthHanlder)
+	mux.HandleFunc("GET /api/notifications", s.listNotifications)
+	mux.HandleFunc("GET /api/notifications/{id}", s.getNotification)
+	mux.HandleFunc("POST /api/notifications", s.createNotification)
+
+	logger.Info("starting :8080", appName, appVersion)
+	http.ListenAndServe(":8080", s.logRequest(contentType(mux)))
+}
