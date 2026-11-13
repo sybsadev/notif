@@ -15,10 +15,24 @@ const (
 	appVersion = "0.1.0"
 )
 
+type Sender interface {
+	Send(Notification) error
+}
+
+type LoggingSender struct {
+	Sender
+	logger *slog.Logger
+}
+
+type ConsoleSender struct{}
+type EmailSender struct{}
+type TelegramSender struct{}
+
 type Server struct {
 	notifications map[int]Notification
 	nextID        int
 	logger        *slog.Logger
+	senders       map[string]Sender
 }
 
 type Notification struct {
@@ -28,6 +42,34 @@ type Notification struct {
 	Body      string `json:"body"`
 	Channel   string `json:"channel"`
 	IsUrgent  bool   `json:"urgent"`
+}
+
+func (l LoggingSender) Send(n Notification) error {
+	l.logger.Info("sending", "to", n.Recipient, "channel", n.Channel)
+
+	err := l.Sender.Send(n)
+	if err != nil {
+		l.logger.Error("send failed", "to", n.Recipient, "error", err)
+		return err
+	}
+
+	l.logger.Info("sent", "to", n.Recipient, "channel", n.Channel)
+	return nil
+}
+
+func (c ConsoleSender) Send(n Notification) error {
+	fmt.Printf("[console] to %s | subject: %s\n", n.Recipient, n.Subject)
+	return nil
+}
+
+func (c EmailSender) Send(n Notification) error {
+	fmt.Printf("[email] to %s | subject: %s\n", n.Recipient, n.Subject)
+	return nil
+}
+
+func (c TelegramSender) Send(n Notification) error {
+	fmt.Printf("[telegram] to %s | subject: %s\n", n.Recipient, n.Subject)
+	return nil
 }
 
 func (n Notification) Format() string {
@@ -53,7 +95,7 @@ func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
 
 	js, err := json.Marshal(all)
 	if err != nil {
-		s.logger.Error("marshal error: ", err)
+		s.logger.Error("marshal", "error", err)
 		return
 	}
 
@@ -79,7 +121,7 @@ func (s *Server) getNotification(w http.ResponseWriter, r *http.Request) {
 
 	js, err := json.Marshal(n)
 	if err != nil {
-		s.logger.Error("marshal error: ", err)
+		s.logger.Error("marshal", "error:", err)
 		return
 	}
 
@@ -106,7 +148,7 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 
 		js, err := json.Marshal(errResp)
 		if err != nil {
-			s.logger.Error("marshal error: ", err)
+			s.logger.Error("marshal", "error:", err)
 			return
 		}
 
@@ -115,13 +157,25 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sender, ok := s.senders[n.Channel]
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error": "invalid channel"}`))
+		return
+	}
+
 	s.nextID++
 	n.ID = s.nextID
 	s.notifications[n.ID] = n
 
+	err = sender.Send(n)
+	if err != nil {
+		s.logger.Error("send failed", "error", err, "channel", n.Channel)
+	}
+
 	js, err := json.Marshal(n)
 	if err != nil {
-		s.logger.Error("marshal error: ", err)
+		s.logger.Error("marshal", "error:", err)
 		return
 	}
 
@@ -150,6 +204,20 @@ func main() {
 	s := &Server{
 		notifications: map[int]Notification{},
 		logger:        logger,
+		senders: map[string]Sender{
+			"console": LoggingSender{
+				ConsoleSender{},
+				logger,
+			},
+			"email": LoggingSender{
+				EmailSender{},
+				logger,
+			},
+			"telegram": LoggingSender{
+				TelegramSender{},
+				logger,
+			},
+		},
 	}
 
 	mux := http.NewServeMux()
