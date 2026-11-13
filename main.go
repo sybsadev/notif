@@ -198,26 +198,34 @@ func contentType(next http.Handler) http.Handler {
 	})
 }
 
+func NewServer(logger *slog.Logger, senders map[string]Sender) (*Server, error) {
+	if logger == nil {
+		return nil, fmt.Errorf("logger is required")
+	}
+	if len(senders) == 0 {
+		return nil, fmt.Errorf("at least 1 sender is required")
+	}
+
+	return &Server{
+		notifications: map[int]Notification{},
+		logger:        logger,
+		senders:       senders,
+	}, nil
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	s := &Server{
-		notifications: map[int]Notification{},
-		logger:        logger,
-		senders: map[string]Sender{
-			"console": LoggingSender{
-				ConsoleSender{},
-				logger,
-			},
-			"email": LoggingSender{
-				EmailSender{},
-				logger,
-			},
-			"telegram": LoggingSender{
-				TelegramSender{},
-				logger,
-			},
-		},
+	senders := map[string]Sender{
+		"console":  LoggingSender{ConsoleSender{}, logger},
+		"email":    LoggingSender{EmailSender{}, logger},
+		"telegram": LoggingSender{TelegramSender{}, logger},
+	}
+
+	s, err := NewServer(logger, senders)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "server: %s\n", err)
+		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
