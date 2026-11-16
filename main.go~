@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,8 +25,12 @@ type LoggingSender struct {
 	logger *slog.Logger
 }
 
-type ConsoleSender struct{}
-type EmailSender struct{}
+type ConsoleSender struct {
+	w io.Writer
+}
+type EmailSender struct {
+	w io.Writer
+}
 type TelegramSender struct{}
 
 type Server struct {
@@ -57,14 +62,30 @@ func (l LoggingSender) Send(n Notification) error {
 	return nil
 }
 
+func NewConsoleSender(w io.Writer) *ConsoleSender {
+	if w == nil {
+		w = os.Stdout
+	}
+
+	return &ConsoleSender{w: w}
+}
+
 func (c ConsoleSender) Send(n Notification) error {
-	fmt.Printf("[console] to %s | subject: %s\n", n.Recipient, n.Subject)
-	return nil
+	_, err := fmt.Fprintf(c.w, "[console] to %s | subject: %s\n", n.Recipient, n.Subject)
+	return err
+}
+
+func NewEmailSender(w io.Writer) *EmailSender {
+	if w == nil {
+		w = os.Stdout
+	}
+
+	return &EmailSender{w: w}
 }
 
 func (c EmailSender) Send(n Notification) error {
-	fmt.Printf("[email] to %s | subject: %s\n", n.Recipient, n.Subject)
-	return nil
+	_, err := fmt.Fprintf(c.w, "[email] to %s | subject: %s\n", n.Recipient, n.Subject)
+	return err
 }
 
 func (c TelegramSender) Send(n Notification) error {
@@ -217,8 +238,8 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	senders := map[string]Sender{
-		"console":  LoggingSender{ConsoleSender{}, logger},
-		"email":    LoggingSender{EmailSender{}, logger},
+		"console":  LoggingSender{Sender: NewConsoleSender(os.Stdout), logger: logger},
+		"email":    LoggingSender{Sender: NewEmailSender(os.Stdout), logger: logger},
 		"telegram": LoggingSender{TelegramSender{}, logger},
 	}
 
