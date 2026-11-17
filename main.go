@@ -71,7 +71,7 @@ func NewConsoleSender(w io.Writer) *ConsoleSender {
 }
 
 func (c ConsoleSender) Send(n Notification) error {
-	_, err := fmt.Fprintf(c.w, "[console] to %s | subject: %s\n", n.Recipient, n.Subject)
+	_, err := fmt.Fprintf(c.w, "[console] to: %s | subject: %s\n", n.Recipient, n.Subject)
 	return err
 }
 
@@ -84,12 +84,12 @@ func NewEmailSender(w io.Writer) *EmailSender {
 }
 
 func (c EmailSender) Send(n Notification) error {
-	_, err := fmt.Fprintf(c.w, "[email] to %s | subject: %s\n", n.Recipient, n.Subject)
+	_, err := fmt.Fprintf(c.w, "[email] to: %s | subject: %s\n", n.Recipient, n.Subject)
 	return err
 }
 
 func (c TelegramSender) Send(n Notification) error {
-	fmt.Printf("[telegram] to %s | subject: %s\n", n.Recipient, n.Subject)
+	fmt.Printf("[telegram] to: %s | subject: %s\n", n.Recipient, n.Subject)
 	return nil
 }
 
@@ -100,6 +100,9 @@ func (n Notification) Format() string {
 func (n Notification) Validate() error {
 	if n.Recipient == "" {
 		return fmt.Errorf("recipient not set")
+	}
+	if n.Channel == "" {
+		return fmt.Errorf("channel not set")
 	}
 	return nil
 }
