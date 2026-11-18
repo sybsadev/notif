@@ -4,12 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+
+	_ "github.com/jackc/pgx/5/stdlib"
+
+	"notifier/internal/notification"
+	"notifier/internal/sender"
 )
 
 const (
@@ -17,107 +21,19 @@ const (
 	appVersion = "0.1.0"
 )
 
-var ErrNotFound = errors.New("notification not found")
-
-type Sender interface {
-	Send(Notification) error
-}
-
-type LoggingSender struct {
-	Sender
-	logger *slog.Logger
-}
-
-type ConsoleSender struct {
-	w io.Writer
-}
-type EmailSender struct {
-	w io.Writer
-}
-type TelegramSender struct{}
-
 type Server struct {
-	notifications map[int]Notification
+	notifications map[int]notification.Notification
 	nextID        int
 	logger        *slog.Logger
-	senders       map[string]Sender
+	senders       map[string]sender.Sender
 }
 
-type Notification struct {
-	ID        int    `json:"id"`
-	Recipient string `json:"to"`
-	Subject   string `json:"subject"`
-	Body      string `json:"body"`
-	Channel   string `json:"channel"`
-	IsUrgent  bool   `json:"urgent"`
-}
-
-func (l LoggingSender) Send(n Notification) error {
-	l.logger.Info("sending", "to", n.Recipient, "channel", n.Channel)
-
-	err := l.Sender.Send(n)
-	if err != nil {
-		l.logger.Error("send failed", "to", n.Recipient, "error", err)
-		return err
-	}
-
-	l.logger.Info("sent", "to", n.Recipient, "channel", n.Channel)
-	return nil
-}
-
-func NewConsoleSender(w io.Writer) *ConsoleSender {
-	if w == nil {
-		w = os.Stdout
-	}
-
-	return &ConsoleSender{w: w}
-}
-
-func (c ConsoleSender) Send(n Notification) error {
-	_, err := fmt.Fprintf(c.w, "[console] to: %s | subject: %s\n", n.Recipient, n.Subject)
-	return err
-}
-
-func NewEmailSender(w io.Writer) *EmailSender {
-	if w == nil {
-		w = os.Stdout
-	}
-
-	return &EmailSender{w: w}
-}
-
-func (c EmailSender) Send(n Notification) error {
-	_, err := fmt.Fprintf(c.w, "[email] to: %s | subject: %s\n", n.Recipient, n.Subject)
-	return err
-}
-
-func (c TelegramSender) Send(n Notification) error {
-	fmt.Printf("[telegram] to: %s | subject: %s\n", n.Recipient, n.Subject)
-	return nil
-}
-
-func (n Notification) Format() string {
-	return fmt.Sprintf("to: %s | subject: %s | body: %s | channel: %s", n.Recipient, n.Subject, n.Body, n.Channel)
-}
-
-func (n Notification) Validate() error {
-	const op = "Notification.Validate"
-
-	if n.Recipient == "" {
-		return fmt.Errorf("%s: recipient not set", op)
-	}
-	if n.Channel == "" {
-		return fmt.Errorf("%s: channel not set", op)
-	}
-	return nil
-}
-
-func (s *Server) findNotification(id int) (Notification, error) {
+func (s *Server) findNotification(id int) (notification.Notification, error) {
 	const op = "Server.findNotification"
 
 	n, ok := s.notifications[id]
 	if !ok {
-		return Notification{}, fmt.Errorf("%s: %w", op, ErrNotFound)
+		return notification.Notification{}, fmt.Errorf("%s: %w", op, notification.ErrNotFound)
 	}
 
 	return n, nil
@@ -128,7 +44,7 @@ func (s *Server) healthHanlder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
-	var all []Notification
+	var all []notification.Notification
 	for _, n := range s.notifications {
 		all = append(all, n)
 	}
@@ -153,7 +69,7 @@ func (s *Server) getNotification(w http.ResponseWriter, r *http.Request) {
 
 	n, err := s.findNotification(id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, notification.ErrNotFound) {
 			http.Error(w, fmt.Errorf("%s: %w", op, err).Error(), http.StatusNotFound)
 			return
 		}
@@ -168,7 +84,7 @@ func (s *Server) getNotification(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 	const op = "Server.createNotification"
 
-	var n Notification
+	var n notification.Notification
 
 	err := json.NewDecoder(r.Body).Decode(&n)
 	if err != nil {
@@ -225,7 +141,7 @@ func contentType(next http.Handler) http.Handler {
 	})
 }
 
-func NewServer(logger *slog.Logger, senders map[string]Sender) (*Server, error) {
+func NewServer(logger *slog.Logger, senders map[string]sender.Sender) (*Server, error) {
 	const op = "NewServer"
 
 	if logger == nil {
@@ -236,19 +152,31 @@ func NewServer(logger *slog.Logger, senders map[string]Sender) (*Server, error) 
 	}
 
 	return &Server{
-		notifications: map[int]Notification{},
+		notifications: map[int]notification.Notification{},
 		logger:        logger,
 		senders:       senders,
 	}, nil
 }
 
+func (s *Server) exportNotification(w http.ResponseWriter, r *http.Request) {
+	const op = "Server.exportNotification"
+
+	if err := WriteAuditLog("audit.log", s.notifications); err != nil {
+		s.logger.Error("export failed", "op", op, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]int{"exported": len(s.notifications)})
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	senders := map[string]Sender{
-		"console":  LoggingSender{Sender: NewConsoleSender(os.Stdout), logger: logger},
-		"email":    LoggingSender{Sender: NewEmailSender(os.Stdout), logger: logger},
-		"telegram": LoggingSender{TelegramSender{}, logger},
+	senders := map[string]sender.Sender{
+		"console":  sender.LoggingSender{Sender: sender.NewConsoleSender(os.Stdout), Logger: logger},
+		"email":    sender.LoggingSender{Sender: sender.NewEmailSender(os.Stdout), Logger: logger},
+		"telegram": sender.LoggingSender{Sender: sender.TelegramSender{}, Logger: logger},
 	}
 
 	s, err := NewServer(logger, senders)
@@ -259,6 +187,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.healthHanlder)
+	mux.HandleFunc("GET /api/notifications/export", s.exportNotification)
 	mux.HandleFunc("GET /api/notifications", s.listNotifications)
 	mux.HandleFunc("GET /api/notifications/{id}", s.getNotification)
 	mux.HandleFunc("POST /api/notifications", s.createNotification)
