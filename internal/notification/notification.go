@@ -9,6 +9,7 @@ type Notification struct {
 	Body      string `json:"body"`
 	Channel   string `json:"channel"`
 	IsUrgent  bool   `json:"urgent"`
+	Status    string `json:"status"`
 }
 
 func (n Notification) Validate() error {

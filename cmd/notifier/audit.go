@@ -7,7 +7,7 @@ import (
 	"notifier/internal/notification"
 )
 
-func WriteAuditLog(path string, notifications map[int]notification.Notification) error {
+func WriteAuditLog(path string, notifications []notification.Notification) error {
 	const op = "WriteAuditLog"
 
 	f, err := os.Create(path)

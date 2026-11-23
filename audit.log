@@ -1,6 +1,3 @@
-id:1 recipient:admin@company.com subject:Test
-id:2 recipient:admin@company.com subject:Test
-id:3 recipient:admin@company.com subject:Test
-id:4 recipient:admin@company.com subject:Test
-id:5 recipient:admin@company.com subject:Test
-id:6 recipient:admin@company.com subject:Test
+id:1 recipient:admin@company;3D;3D.com subject:Build failed
+id:2 recipient:admin@company;3D;3D.com subject:Build failed
+id:3 recipient:admin@company.com subject:Build failed

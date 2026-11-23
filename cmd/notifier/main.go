@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +11,11 @@ import (
 	"strconv"
 	"time"
 
-	_ "github.com/jackc/pgx/5/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"notifier/internal/notification"
 	"notifier/internal/sender"
+	"notifier/internal/store"
 )
 
 const (
@@ -22,40 +24,30 @@ const (
 )
 
 type Server struct {
-	notifications map[int]notification.Notification
-	nextID        int
-	logger        *slog.Logger
-	senders       map[string]sender.Sender
+	store   store.Store
+	logger  *slog.Logger
+	senders map[string]sender.Sender
 }
 
-func (s *Server) findNotification(id int) (notification.Notification, error) {
-	const op = "Server.findNotification"
-
-	n, ok := s.notifications[id]
-	if !ok {
-		return notification.Notification{}, fmt.Errorf("%s: %w", op, notification.ErrNotFound)
-	}
-
-	return n, nil
-}
-
-func (s *Server) healthHanlder(w http.ResponseWriter, r *http.Request) {
+func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status": "ok", "version":"` + appVersion + `"}`))
 }
 
 func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
-	var all []notification.Notification
-	for _, n := range s.notifications {
-		all = append(all, n)
-	}
+	const op = "Server.listNotifications"
 
-	js, err := json.Marshal(all)
+	notifications, err := s.store.GetAll()
 	if err != nil {
-		s.logger.Error("marshal", "error", err)
+		s.logger.Error("list failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	w.Write(js)
+	if notifications == nil {
+		notifications = []notification.Notification{}
+	}
+
+	json.NewEncoder(w).Encode(notifications)
 }
 
 func (s *Server) getNotification(w http.ResponseWriter, r *http.Request) {
@@ -65,9 +57,10 @@ func (s *Server) getNotification(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("%s: invalid id", op), http.StatusBadRequest)
+		return
 	}
 
-	n, err := s.findNotification(id)
+	n, err := s.store.GetById(id)
 	if err != nil {
 		if errors.Is(err, notification.ErrNotFound) {
 			http.Error(w, fmt.Errorf("%s: %w", op, err).Error(), http.StatusNotFound)
@@ -86,44 +79,40 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 
 	var n notification.Notification
 
-	err := json.NewDecoder(r.Body).Decode(&n)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "invalid json"}`))
+	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	err = n.Validate()
-	if err != nil {
-		err = fmt.Errorf("%s: %w", op, err)
+	if err := n.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	sender, ok := s.senders[n.Channel]
-	if !ok {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "invalid channel"}`))
+	id, err := s.store.Save(n)
+	if err != nil {
+		s.logger.Error("save failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	s.nextID++
-	n.ID = s.nextID
-	s.notifications[n.ID] = n
+	n.ID = id
+	n.Status = "pending"
 
-	err = sender.Send(n)
-	if err != nil {
-		s.logger.Error("send failed", "error", err, "channel", n.Channel)
-	}
-
-	js, err := json.Marshal(n)
-	if err != nil {
-		s.logger.Error("marshal", "error:", err)
-		return
+	snd, ok := s.senders[n.Channel]
+	if ok {
+		if err := snd.Send(n); err != nil {
+			s.logger.Error("send failed", "id", id, "err", err)
+			_ = s.store.UpdateStatus(id, "failed")
+			n.Status = "failed"
+		} else {
+			_ = s.store.UpdateStatus(id, "sent")
+			n.Status = "sent"
+		}
 	}
 
 	w.WriteHeader(http.StatusCreated)
-	w.Write(js)
+	json.NewEncoder(w).Encode(n)
 }
 
 func (s *Server) logRequest(next http.Handler) http.Handler {
@@ -141,37 +130,83 @@ func contentType(next http.Handler) http.Handler {
 	})
 }
 
-func NewServer(logger *slog.Logger, senders map[string]sender.Sender) (*Server, error) {
+func NewServer(st store.Store, logger *slog.Logger, senders map[string]sender.Sender) (*Server, error) {
 	const op = "NewServer"
+
+	if st == nil {
+		return nil, fmt.Errorf("%s: store is required", op)
+	}
 
 	if logger == nil {
 		return nil, fmt.Errorf("%s: logger is required", op)
 	}
+
 	if len(senders) == 0 {
 		return nil, fmt.Errorf("%s: at least 1 sender is required", op)
 	}
 
 	return &Server{
-		notifications: map[int]notification.Notification{},
-		logger:        logger,
-		senders:       senders,
+		store:   st,
+		logger:  logger,
+		senders: senders,
 	}, nil
 }
 
 func (s *Server) exportNotification(w http.ResponseWriter, r *http.Request) {
 	const op = "Server.exportNotification"
 
-	if err := WriteAuditLog("audit.log", s.notifications); err != nil {
+	notifications, err := s.store.GetAll()
+	if err != nil {
 		s.logger.Error("export failed", "op", op, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]int{"exported": len(s.notifications)})
+	if err := WriteAuditLog("audit.log", notifications); err != nil {
+		s.logger.Error("export failed", "op", op, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]int{"exported": len(notifications)})
 }
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	const dsn = "host=localhost port=5432 user=postgres password=notifier dbname=postgres sslmode=disable"
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sql.open: %s\n", err)
+		os.Exit(1)
+	}
+
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		fmt.Fprintf(os.Stderr, "db ping failed: %s\n", err)
+		os.Exit(1)
+	}
+
+	logger.Info("database connected")
+
+	const createTable = `
+	CREATE TABLE IF NOT EXISTS notifications (
+		id SERIAL PRIMARY KEY,
+		recipient TEXT NOT NULL,
+		subject TEXT NOT NULL,
+		body TEXT,
+		channel TEXT,
+		is_urgent BOOLEAN DEFAULT FALSE,
+		status TEXT NOT NULL DEFAULT 'pending'
+	)`
+
+	if _, err := db.Exec(createTable); err != nil {
+		fmt.Fprintf(os.Stderr, "create table: %s\n", err)
+		os.Exit(1)
+	}
+
+	logger.Info("notifications table ready")
 
 	senders := map[string]sender.Sender{
 		"console":  sender.LoggingSender{Sender: sender.NewConsoleSender(os.Stdout), Logger: logger},
@@ -179,14 +214,16 @@ func main() {
 		"telegram": sender.LoggingSender{Sender: sender.TelegramSender{}, Logger: logger},
 	}
 
-	s, err := NewServer(logger, senders)
+	store := store.NewPostgresStore(db)
+
+	s, err := NewServer(store, logger, senders)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "server: %s\n", err)
 		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.healthHanlder)
+	mux.HandleFunc("/health", s.healthHandler)
 	mux.HandleFunc("GET /api/notifications/export", s.exportNotification)
 	mux.HandleFunc("GET /api/notifications", s.listNotifications)
 	mux.HandleFunc("GET /api/notifications/{id}", s.getNotification)
